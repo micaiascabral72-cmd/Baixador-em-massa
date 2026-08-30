@@ -3,151 +3,259 @@ import yt_dlp
 import os
 import re
 import shutil
-import tempfile
-import zipfile
+import subprocess
+import time
 
-st.set_page_config(page_title="Mega Downloader", page_icon="🎬", layout="centered")
+# --------------------------------------------------------------------------------------
+# CONFIGURAÇÃO DA PÁGINA
+# --------------------------------------------------------------------------------------
+st.set_page_config(page_title="Baixador de Vídeos", page_icon="🎬", layout="centered")
 
 st.title("🚀 Mega Downloader de Vídeos")
-st.write(
-    "Baixe vídeos únicos ou perfis inteiros em alta qualidade, sem marca d'água da plataforma."
+st.caption(
+    "Baixe vídeos únicos ou perfis inteiros, em alta qualidade e sem marca d'água. "
+    "Também dá pra extrair apenas o áudio (MP3) — ative na barra lateral."
 )
 
-# ---------------------------------------------------------------
-# Interface
-# ---------------------------------------------------------------
-url = st.text_input(
-    "🔗 Cole o link aqui (URL do Vídeo ou do Perfil):",
-    placeholder="Ex: https://www.tiktok.com/@nomedoperfil",
+st.warning(
+    "⚠️ Use esta ferramenta apenas para baixar conteúdo próprio ou que você tem "
+    "autorização para baixar. Respeite os direitos autorais e os termos de uso "
+    "de cada plataforma."
 )
 
-modo = st.radio(
-    "⚙️ Modo de Download:",
-    ["Um por vez (Vídeo Único)", "Baixar Tudo (Perfil Completo)"],
-)
+# --------------------------------------------------------------------------------------
+# SIDEBAR - CONFIGURAÇÕES AVANÇADAS
+# --------------------------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Configurações")
 
-col1, col2 = st.columns(2)
-with col1:
-    qualidade = st.selectbox(
-        "🎚️ Qualidade:",
-        ["Melhor disponível", "1080p ou menor", "720p ou menor"],
+    apenas_audio = st.checkbox("🎵 Extrair apenas o áudio (MP3)", value=False)
+
+    if not apenas_audio:
+        qualidade = st.selectbox("Qualidade do vídeo", ["Melhor disponível", "1080p", "720p", "480p"])
+    else:
+        qualidade = "Melhor disponível"
+        st.caption("ℹ️ No modo áudio, o vídeo é descartado e só o som é salvo em MP3.")
+
+    limite = st.number_input(
+        "Limite de vídeos (modo perfil completo)",
+        min_value=1, max_value=200, value=30, step=1,
+        help="Trava de segurança pra não baixar centenas de vídeos sem querer. Aumente se precisar."
     )
-with col2:
-    limite = None
-    if modo == "Baixar Tudo (Perfil Completo)":
-        usar_limite = st.checkbox("Limitar quantidade de vídeos?")
-        if usar_limite:
-            limite = st.number_input("Máximo de vídeos:", min_value=1, value=20, step=1)
+
+    remover_logo = False
+    canto = None
+    percentual_corte = 12
+    if not apenas_audio:
+        remover_logo = st.checkbox("Tentar remover logo/marca no canto do vídeo", value=False)
+        if remover_logo:
+            st.caption(
+                "⚠️ Isso usa o filtro 'delogo' do ffmpeg pra apagar uma área do vídeo. "
+                "Funciona bem para logos fixas e pequenas, mas não é perfeito em todos os casos."
+            )
+            canto = st.selectbox(
+                "Onde fica a marca?",
+                ["Canto superior direito", "Canto superior esquerdo",
+                 "Canto inferior direito", "Canto inferior esquerdo"]
+            )
+            percentual_corte = st.slider("Tamanho da área a cobrir (%)", 5, 25, 12)
+
+# --------------------------------------------------------------------------------------
+# INTERFACE PRINCIPAL
+# --------------------------------------------------------------------------------------
+url = st.text_input(
+    "🔗 Cole o link aqui (vídeo único ou perfil):",
+    placeholder="Ex: https://www.tiktok.com/@nomedoperfil"
+)
+modo = st.radio("Modo de download:", ["Vídeo único", "Perfil completo (todos os vídeos)"])
 
 iniciar = st.button("Iniciar Download", type="primary")
 
-# ---------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------
-def sanitizar_nome(nome: str, max_len: int = 120) -> str:
-    """Remove caracteres problemáticos e limita o tamanho do nome de arquivo."""
-    nome = re.sub(r'[\\/:*?"<>|]', "_", nome)
-    return nome[:max_len]
+FORMAT_MAP = {
+    "Melhor disponível": "bv*+ba/b",
+    "1080p": "bv*[height<=1080]+ba/b[height<=1080]",
+    "720p": "bv*[height<=720]+ba/b[height<=720]",
+    "480p": "bv*[height<=480]+ba/b[height<=480]",
+}
 
 
-def formato_por_qualidade(escolha: str) -> str:
-    if escolha == "1080p ou menor":
-        return "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
-    if escolha == "720p ou menor":
-        return "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
-    return "bestvideo+bestaudio/best"
+def sanitize(nome: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "_", nome)[:80]
 
 
-def montar_opcoes(download_dir, modo, qualidade, limite, progress_bar, status_box, contador):
-    def hook(d):
-        if d["status"] == "downloading":
-            nome = d.get("info_dict", {}).get("title", "vídeo")
-            pct = d.get("_percent_str", "").strip()
-            status_box.info(f"⬇️ Baixando: {nome[:60]} — {pct}")
-        elif d["status"] == "finished":
-            contador["ok"] += 1
-            status_box.success(f"✅ Concluído: {contador['ok']} vídeo(s) baixado(s) até agora.")
+def cobrir_logo(caminho_video: str, canto: str, percentual: int) -> bool:
+    """Tenta apagar uma área (canto) do vídeo usando o filtro delogo do ffmpeg.
+    Best-effort: funciona melhor com logos pequenas e estáticas."""
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", caminho_video],
+            capture_output=True, text=True, timeout=15
+        )
+        w, h = map(int, probe.stdout.strip().split(","))
+    except Exception:
+        return False
 
-    opts = {
-        "outtmpl": os.path.join(download_dir, "%(uploader)s_%(title).80s_%(id)s.%(ext)s"),
-        "format": formato_por_qualidade(qualidade),
-        "merge_output_format": "mp4",
-        "ignoreerrors": True,
-        "no_warnings": True,
-        "restrictfilenames": False,
-        "progress_hooks": [hook],
-        "concurrent_fragment_downloads": 4,
-        # Evita reprocessar itens que já falharam repetidamente
-        "retries": 3,
-        "fragment_retries": 3,
+    box_w = max(int(w * percentual / 100), 10)
+    box_h = max(int(h * percentual / 100), 10)
+
+    posicoes = {
+        "Canto superior direito": (w - box_w, 0),
+        "Canto superior esquerdo": (0, 0),
+        "Canto inferior direito": (w - box_w, h - box_h),
+        "Canto inferior esquerdo": (0, h - box_h),
     }
+    x, y = posicoes[canto]
 
-    if modo == "Um por vez (Vídeo Único)":
-        opts["noplaylist"] = True
-    else:
-        opts["noplaylist"] = False
-        if limite:
-            opts["playlistend"] = int(limite)
+    saida = caminho_video + ".tmp.mp4"
+    cmd = [
+        "ffmpeg", "-y", "-i", caminho_video,
+        "-vf", f"delogo=x={x}:y={y}:w={box_w}:h={box_h}:show=0",
+        "-c:a", "copy", saida
+    ]
+    try:
+        resultado = subprocess.run(cmd, capture_output=True, timeout=300)
+    except Exception:
+        return False
 
-    return opts
+    if resultado.returncode == 0 and os.path.exists(saida) and os.path.getsize(saida) > 0:
+        os.remove(caminho_video)
+        os.rename(saida, caminho_video)
+        return True
+
+    if os.path.exists(saida):
+        os.remove(saida)
+    return False
 
 
-# ---------------------------------------------------------------
-# Execução
-# ---------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# LÓGICA DE DOWNLOAD
+# --------------------------------------------------------------------------------------
 if iniciar:
-    if not url:
+    if not url.strip():
         st.warning("⚠️ Por favor, insira um link válido.")
     else:
-        with tempfile.TemporaryDirectory() as download_dir:
-            progress_bar = st.progress(0)
-            status_box = st.empty()
-            contador = {"ok": 0}
+        download_dir = f"temp_downloads_{int(time.time())}"
+        os.makedirs(download_dir, exist_ok=True)
 
-            ydl_opts = montar_opcoes(
-                download_dir, modo, qualidade, limite, progress_bar, status_box, contador
-            )
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        contador = {"feito": 0, "total": 0}
 
-            erros = []
+        def hook(d):
+            if d["status"] == "downloading":
+                titulo = d.get("info_dict", {}).get("title", "vídeo")
+                status_text.text(f"⬇️ Baixando: {str(titulo)[:50]}...")
+            elif d["status"] == "finished":
+                contador["feito"] += 1
+                if contador["total"]:
+                    progress_bar.progress(min(contador["feito"] / contador["total"], 1.0))
+
+        ydl_opts = {
+            "outtmpl": f"{download_dir}/%(uploader)s_%(title).60s.%(ext)s",
+            "ignoreerrors": True,
+            "no_warnings": True,
+            "quiet": True,
+            "progress_hooks": [hook],
+            "restrictfilenames": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "concurrent_fragment_downloads": 4,
+        }
+
+        if apenas_audio:
+            ydl_opts["format"] = "bestaudio/best"
+            ydl_opts["postprocessors"] = [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }]
+        else:
+            ydl_opts["format"] = FORMAT_MAP[qualidade]
+            ydl_opts["merge_output_format"] = "mp4"
+
+        if modo == "Vídeo único":
+            ydl_opts["noplaylist"] = True
+        else:
+            ydl_opts["noplaylist"] = False
+            ydl_opts["playlistend"] = int(limite)
+
+        try:
+            # Tenta descobrir quantos vídeos existem, só pra alimentar a barra de progresso.
+            # Se falhar, segue sem número exato (a barra fica indeterminada).
             try:
+                with yt_dlp.YoutubeDL({**ydl_opts, "extract_flat": True, "quiet": True}) as ydl_info:
+                    info = ydl_info.extract_info(url, download=False)
+                    if info and "entries" in info and info["entries"]:
+                        entradas = [e for e in info["entries"] if e]
+                        contador["total"] = min(len(entradas), int(limite)) if modo != "Vídeo único" else 1
+                    else:
+                        contador["total"] = 1
+            except Exception:
+                contador["total"] = 0
+
+            with st.spinner("Baixando... isso pode demorar dependendo da quantidade de vídeos."):
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
-            except Exception as e:
-                erros.append(str(e))
 
-            arquivos = [
+            extensoes = (".mp3",) if apenas_audio else (".mp4", ".mov", ".webm", ".mkv")
+            arquivos = sorted(
                 f for f in os.listdir(download_dir)
-                if os.path.isfile(os.path.join(download_dir, f))
-            ]
-
-            progress_bar.progress(100)
+                if f.lower().endswith(extensoes)
+            )
 
             if not arquivos:
+                item = "áudio" if apenas_audio else "vídeo"
                 st.error(
-                    "❌ Nenhum vídeo pôde ser baixado. O perfil pode ser privado, "
-                    "o link é inválido, ou a plataforma bloqueou o acesso no momento."
+                    f"❌ Nenhum {item} pôde ser baixado. O perfil pode ser privado, "
+                    "o link pode estar inválido, ou a plataforma bloqueou o acesso."
                 )
-                if erros:
-                    with st.expander("Detalhes técnicos do erro"):
-                        st.code("\n".join(erros))
             else:
-                st.success(f"✅ Sucesso! {len(arquivos)} vídeo(s) baixado(s).")
+                if remover_logo:
+                    with st.spinner(f"Tentando remover a marca em {len(arquivos)} vídeo(s)..."):
+                        for arq in arquivos:
+                            caminho = os.path.join(download_dir, arq)
+                            if caminho.lower().endswith(".mp4"):
+                                cobrir_logo(caminho, canto, percentual_corte)
 
-                zip_path = os.path.join(tempfile.gettempdir(), "meus_videos.zip")
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for f in arquivos:
-                        zf.write(os.path.join(download_dir, f), arcname=f)
+                item_label = "áudio(s)" if apenas_audio else "vídeo(s)"
+                st.success(f"✅ Sucesso! {len(arquivos)} {item_label} baixado(s).")
 
-                with open(zip_path, "rb") as f:
+                if len(arquivos) == 1:
+                    caminho_unico = os.path.join(download_dir, arquivos[0])
+                    with open(caminho_unico, "rb") as f:
+                        arquivo_bytes = f.read()
+                    if apenas_audio:
+                        st.download_button(
+                            "⬇️ Baixar Áudio (MP3)",
+                            data=arquivo_bytes,
+                            file_name=sanitize(arquivos[0]),
+                            mime="audio/mpeg",
+                        )
+                    else:
+                        st.download_button(
+                            "⬇️ Baixar Vídeo",
+                            data=arquivo_bytes,
+                            file_name=sanitize(arquivos[0]),
+                            mime="video/mp4",
+                        )
+                else:
+                    prefixo = "audios_baixados" if apenas_audio else "videos_baixados"
+                    zip_base = f"{prefixo}_{int(time.time())}"
+                    zip_path = shutil.make_archive(zip_base, "zip", download_dir)
+                    with open(zip_path, "rb") as f:
+                        zip_bytes = f.read()
+                    label_zip = "⬇️ Baixar Todos os Áudios (.zip)" if apenas_audio else "⬇️ Baixar Todos (.zip)"
+                    nome_zip = "meus_audios.zip" if apenas_audio else "meus_videos.zip"
                     st.download_button(
-                        label="⬇️ Baixar Arquivo ZIP",
-                        data=f,
-                        file_name="meus_videos.zip",
+                        label_zip,
+                        data=zip_bytes,
+                        file_name=nome_zip,
                         mime="application/zip",
                     )
+                    os.remove(zip_path)
 
-                with st.expander("Ver lista de vídeos baixados"):
-                    for f in arquivos:
-                        st.write(f"• {f}")
-
-                os.remove(zip_path)
+        except Exception as e:
+            st.error(f"Ocorreu um erro: {str(e)}")
+        finally:
+            shutil.rmtree(download_dir, ignore_errors=True)
